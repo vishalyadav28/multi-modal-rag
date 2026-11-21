@@ -363,7 +363,7 @@ def show_image(image_path):
     Image.open(image_path).show()  # plain script: opens the OS image viewer
 
 
-def ask_rag(question, show_sources=True, show_images=False):
+def ask_rag(question, show_sources=True, show_images=True, show_tables=True):
 
     # 1. Retrieve from Pinecone
     retrieved_docs = retriever.invoke(question)
@@ -411,10 +411,22 @@ def ask_rag(question, show_sources=True, show_images=False):
                 f"| {doc.metadata.get('modality')}"
             )
 
+    if show_tables:
+        tables = [doc for doc in retrieved_docs if doc.metadata.get("modality") == "table"]
+
+        if tables:
+            print("\nRETRIEVED TABLES:")
+
+            for doc in tables:
+                print(f"\n[Page {int(doc.metadata.get('page'))}]")
+                print(doc.page_content)
+
     if show_images and image_paths:
         print("\nRETRIEVED VISUALS:")
 
-        for image_path in image_paths:
+        # Same images the vision model saw (answer_with_vision uses the first 3).
+        for image_path in image_paths[:3]:
+            print(image_path)
             show_image(image_path)
 
     return {
