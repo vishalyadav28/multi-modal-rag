@@ -1,0 +1,11 @@
+langchain
+langchain-core
+langchain-huggingface
+langchain-pinecone
+pinecone
+sentence-transformers
+pymupdf
+pandas
+tabulate
+pillow
+langchain-ollama

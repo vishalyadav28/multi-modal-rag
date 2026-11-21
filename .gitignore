@@ -1,0 +1,6 @@
+.venv
+.env
+.DS_Store
+ARCHITECTURE.md
+novacore_extracted_images/
+__pycache__/
