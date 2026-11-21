@@ -25,6 +25,7 @@ PDF_PATH = Path("./NovaCore_Multimodal_Company_Report_2026.pdf")
 TEXT_MODEL = "qwen3:4b"
 VISION_MODEL = "qwen2.5vl:7b"  # local; gemma4:31b-cloud needs Ollama cloud credits
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_DIMENSION = 384  # must match EMBEDDING_MODEL's output size
 
 PINECONE_INDEX_NAME = "novacore-multimodal-rag"
 PINECONE_NAMESPACE = "SAT21NOV"
@@ -42,9 +43,9 @@ for line in Path(".env").read_text().splitlines() if Path(".env").exists() else 
         key, value = line.split("=", 1)
         os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
 
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 
-vision_llm = ChatOllama(model=VISION_MODEL, temperature=0, num_predict=500)
+# num_ctx: Ollama defaults to 4096 tokens; 3 images + retrieved context needs more.
+vision_llm = ChatOllama(model=VISION_MODEL, temperature=0, num_predict=500, num_ctx=16384)
 
 
 def image_to_data_uri(image_path):
@@ -230,17 +231,34 @@ print("Table pages:", [d.metadata["page"] for d in documents if d.metadata["moda
 # 4. EMBED + STORE IN PINECONE
 embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 
-pc = Pinecone(api_key=PINECONE_API_KEY)
+pc = Pinecone(
+    api_key=os.environ["PINECONE_API_KEY"]  # fail fast with a clear KeyError if the key is missing
+)
+
 if not pc.has_index(PINECONE_INDEX_NAME):
+    print("Creating Pinecone index...")
+
+    # Pinecone SDK 7.x: create_index() blocks until the index is ready (timeout=None).
     pc.create_index(
         name=PINECONE_INDEX_NAME,
-        dimension=384,  # all-MiniLM-L6-v2 output size
+        dimension=EMBEDDING_DIMENSION,
         metric="cosine",
-        spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+        spec=ServerlessSpec(
+            cloud="aws",
+            region="us-east-1",
+        ),
     )
 
+    print("Pinecone index created.")
+else:
+    print("Pinecone index already exists.")
+
+index = pc.Index(PINECONE_INDEX_NAME)
+
+print("Connected to:", PINECONE_INDEX_NAME)
+
 vector_store = PineconeVectorStore(
-    index=pc.Index(PINECONE_INDEX_NAME),
+    index=index,
     embedding=embeddings,
     namespace=PINECONE_NAMESPACE,
 )
@@ -260,28 +278,158 @@ print("Upserted", len(ids), "documents to Pinecone")
 text_llm = ChatOllama(model=TEXT_MODEL, temperature=0, reasoning=False)
 
 
-def ask(question, k=6):
-    # Serverless Pinecone is eventually consistent; fresh upserts can take a few seconds to show up.
-    hits = vector_store.similarity_search(question, k=k)
-    context = "\n\n".join(
-        f"[p.{int(d.metadata['page'])} {d.metadata['modality']}]\n{d.page_content}" for d in hits
+retriever = vector_store.as_retriever(search_kwargs={"k": 6})
+
+# qwen3 can still emit its reasoning even with reasoning=False; keep only the final answer.
+text_rag_chain = (
+    ChatPromptTemplate.from_template(
+        "Answer only from the context below. Mention page numbers like (Page 3). "
+        "If the information is missing, say you could not find it.\n\n"
+        "Context:\n{context}\n\nQuestion: {question}"
     )
-    answer = text_llm.invoke(
-        "Answer only from the context below. Cite pages like [p.3].\n\n"
-        f"Context:\n{context}\n\nQuestion: {question}"
-    ).content
-    # qwen3 can still emit its reasoning even with reasoning=False; keep only the final answer.
-    return answer.split("</think>")[-1].strip(), hits
+    | text_llm
+    | StrOutputParser()
+    | (lambda text: text.split("</think>")[-1].strip())
+)
 
 
-time.sleep(10)  # let the fresh upserts become searchable
+def format_context(retrieved_docs):
+    parts = []
+
+    for doc in retrieved_docs:
+        page = int(doc.metadata.get("page"))  # Pinecone returns numbers as floats (3.0)
+        modality = doc.metadata.get("modality")
+
+        parts.append(
+            f"[Page {page} | {modality.upper()}]\n"
+            f"{doc.page_content}"
+        )
+
+    return "\n\n".join(parts)
+
+
+def answer_with_vision(question, context, image_paths):
+    image_paths = image_paths[:3]
+
+    content = [
+        {
+            "type": "text",
+            "text": f"""
+You are answering questions about the NovaCore Systems FY2026 report.
+
+Use ONLY the retrieved context and the attached retrieved visuals.
+
+RETRIEVED CONTEXT:
+{context}
+
+QUESTION:
+{question}
+
+Instructions:
+- Answer factually.
+- Use the attached visuals when relevant.
+- Mention page numbers.
+- If the information is missing, say you could not find it.
+""",
+        }
+    ]
+
+    for image_path in image_paths:
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": image_to_data_uri(image_path)
+                },
+            }
+        )
+
+    # Local Ollama vision model (no Groq account/key configured in this project).
+    response = vision_llm.invoke([HumanMessage(content=content)])
+
+    return response.content.strip()
+
+
+def show_image(image_path):
+    try:
+        from IPython import get_ipython
+        from IPython.display import display
+
+        if get_ipython() is not None:  # running inside Jupyter
+            display(Image.open(image_path))
+            return
+    except ImportError:
+        pass
+    Image.open(image_path).show()  # plain script: opens the OS image viewer
+
+
+def ask_rag(question, show_sources=True, show_images=False):
+
+    # 1. Retrieve from Pinecone
+    retrieved_docs = retriever.invoke(question)
+
+    # 2. Create context
+    context = format_context(retrieved_docs)
+
+    # 3. Check whether Pinecone returned visuals
+    image_paths = []
+
+    for doc in retrieved_docs:
+        if doc.metadata.get("modality") == "visual":
+            image_path = doc.metadata.get("image_path")
+
+            if image_path and Path(image_path).exists():
+                image_paths.append(image_path)
+
+    # 4. Generate the answer
+    if image_paths:
+        answer = answer_with_vision(
+            question=question,
+            context=context,
+            image_paths=image_paths,
+        )
+    else:
+        answer = text_rag_chain.invoke(
+            {
+                "context": context,
+                "question": question,
+            }
+        )
+
+    print("\nQUESTION:")
+    print(question)
+
+    print("\nANSWER:")
+    print(answer)
+
+    if show_sources:
+        print("\nPINECONE RETRIEVED SOURCES:")
+
+        for i, doc in enumerate(retrieved_docs, start=1):
+            print(
+                f"{i}. Page {int(doc.metadata.get('page'))} "
+                f"| {doc.metadata.get('modality')}"
+            )
+
+    if show_images and image_paths:
+        print("\nRETRIEVED VISUALS:")
+
+        for image_path in image_paths:
+            show_image(image_path)
+
+    return {
+        "answer": answer,
+        "documents": retrieved_docs,
+        "image_paths": image_paths,
+    }
+
+
+time.sleep(10)  # serverless Pinecone: let the fresh upserts become searchable
 
 for question in [
-    "❯ how was the revenue in usd in Q1 2025",
+    "how was the revenue in usd in Q1 2025",
+    "Where is the headquarters",
 ]:
-    answer, hits = ask(question)
-    print("\nQ:", question)
-    print("Retrieved:", [(int(d.metadata["page"]), d.metadata["modality"]) for d in hits])
-    print("A:", answer)
+    ask_rag(question)
 
 
